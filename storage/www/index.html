@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>ESP32 Sensor Dashboard</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <style>
+    body { font-family: Arial; margin: 20px; }
+    .top { display: flex; gap: 20px; margin-bottom: 20px; }
+    .card {
+      padding: 10px;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      min-width: 250px;
+    }
+    canvas { margin-top: 20px; max-width: 100%; }
+    textarea { width: 100%; height: 200px; margin-top: 10px; }
+  </style>
+</head>
+
+<body>
+
+<h2>ESP32 Sensor Dashboard</h2>
+
+<div class="top">
+  <div class="card">
+    <h3>Latest Reading</h3>
+    <div id="latest">Loading...</div>
+  </div>
+
+  <div class="card">
+    <h3>Extreme Values</h3>
+    <div id="extremes">Loading...</div>
+  </div>
+</div>
+
+<canvas id="tempChart"></canvas>
+<canvas id="humChart"></canvas>
+<canvas id="pressChart"></canvas>
+
+<hr>
+
+<h3>Debug Tools</h3>
+
+<button onclick="loadFiles()">Load Files</button>
+<select id="fileList"></select>
+<button onclick="loadFileContent()">View File</button>
+
+<script>
+function loadLog() {
+    fetch('/get_file?filename=data/log.txt')
+        .then(r => r.text())
+        .then(t => document.getElementById('log').textContent = t);
+}
+</script>
+
+<form method="POST" action="/wifi_config">
+  SSID: <input name="ssid"><br>
+  Password: <input name="password" type="password"><br>
+  <button type="submit">Save</button>
+</form>
+
+<textarea id="fileContent" placeholder="File content will appear here..."></textarea>
+
+
+  <h1>ESP32 Status</h1>
+  <p>Start Time: <span id="starttime">-</span></p>
+  <p>MAC Address: <span id="macaddr">-</span></p>
+  <p>IP Address: <span id="ipaddr">-</span></p>
+  <p>Hostname: <span id="hostname">-</span></p>
+  <p>WiFi SSID: <span id="wifiStatus">-</span></p>
+
+  <script>
+    async function fetchNodeInfo() {
+    const res = await fetch("/get_node");
+    const json = await res.json();
+
+    if (!json.node) return [];
+    document.getElementById("starttime").textContent = json.node.starttime || "-";
+    document.getElementById("macaddr").textContent = json.node.mac || "-";
+    document.getElementById("ipaddr").textContent = json.node.ip || "-";
+    document.getElementById("hostname").textContent = json.node.name || "-";
+    document.getElementById("wifiStatus").textContent = json.node.ssid || "-";
+    }
+  </script>
+
+
+<script>
+
+let tempChart, humChart, pressChart;
+let sensorData = [];
+let eventSource = null;
+
+/* ---------------- FETCH DATA ---------------- */
+
+async function fetchData() {
+  const res = await fetch("/data");
+  const json = await res.json();
+
+  if (!json.data) return [];
+
+  return json.data
+    .map(d => ({
+      ts: d.ts,
+      t: Number(d.t),
+      h: Number(d.h),
+      p: Number(d.p)
+    }))
+    .filter(d => !isNaN(d.t) && !isNaN(d.h) && !isNaN(d.p));
+}
+
+/* ---------------- NODE INFO ---------------- */
+
+async function fetchNodeInfo() {
+  try {
+    const res = await fetch("/get_node");
+    const json = await res.json();
+
+    if (!json.node) return;
+
+    document.getElementById("starttime").textContent = json.node.starttime || "-";
+    document.getElementById("macaddr").textContent = json.node.mac || "-";
+    document.getElementById("ipaddr").textContent = json.node.ip || "-";
+    document.getElementById("hostname").textContent = json.node.name || "-";
+    document.getElementById("wifiStatus").textContent = json.node.ssid || "-";
+  } catch (err) {
+    console.error("fetchNodeInfo failed:", err);
+  }
+}
+
+/* ---------------- FORMAT TIME ---------------- */
+
+function formatTime(ts) {
+  const d = new Date(ts);
+  return d.getFullYear() + "-" +
+    String(d.getMonth() + 1).padStart(2, '0') + "-" +
+    String(d.getDate()).padStart(2, '0') + " " +
+    String(d.getHours()).padStart(2, '0') + ":" +
+    String(d.getMinutes()).padStart(2, '0') + ":" +
+    String(d.getSeconds()).padStart(2, '0');
+}
+
+/* ---------------- UPDATE UI ---------------- */
+
+function updateLatest(data) {
+  if (!data.length) return;
+
+  const last = data[data.length - 1];
+
+  document.getElementById("latest").innerHTML = `
+    <b>Time:</b> ${formatTime(last.ts)}<br>
+    <b>Temp:</b> ${last.t.toFixed(1)} °C<br>
+    <b>Humidity:</b> ${last.h.toFixed(1)} %<br>
+    <b>Pressure:</b> ${last.p.toFixed(1)} hPa
+  `;
+}
+
+function updateExtremes(data) {
+  if (!data.length) return;
+
+  let minT = data[0], maxT = data[0];
+  let minH = data[0], maxH = data[0];
+  let minP = data[0], maxP = data[0];
+
+  data.forEach(d => {
+    if (d.t < minT.t) minT = d;
+    if (d.t > maxT.t) maxT = d;
+    if (d.h < minH.h) minH = d;
+    if (d.h > maxH.h) maxH = d;
+    if (d.p < minP.p) minP = d;
+    if (d.p > maxP.p) maxP = d;
+  });
+
+  document.getElementById("extremes").innerHTML = `
+    <b>Temp:</b> min ${minT.t.toFixed(1)} (${formatTime(minT.ts)})
+    / max ${maxT.t.toFixed(1)} (${formatTime(maxT.ts)})<br>
+    <b>Humidity:</b> min ${minH.h.toFixed(1)} (${formatTime(minH.ts)})
+    / max ${maxH.h.toFixed(1)} (${formatTime(maxH.ts)})<br>
+    <b>Pressure:</b> min ${minP.p.toFixed(1)} (${formatTime(minP.ts)})
+    / max ${maxP.p.toFixed(1)} (${formatTime(maxP.ts)})
+  `;
+}
+
+/* ---------------- CHARTS ---------------- */
+
+function createCharts(data) {
+  const labels = data.map(d => formatTime(d.ts));
+  const temp = data.map(d => d.t);
+  const hum = data.map(d => d.h);
+  const press = data.map(d => d.p);
+
+  if (tempChart) tempChart.destroy();
+  if (humChart) humChart.destroy();
+  if (pressChart) pressChart.destroy();
+
+  tempChart = new Chart(document.getElementById("tempChart"), {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{ label: "Temp", data: temp }]
+    }
+  });
+
+  humChart = new Chart(document.getElementById("humChart"), {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{ label: "Humidity", data: hum }]
+    }
+  });
+
+  pressChart = new Chart(document.getElementById("pressChart"), {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{ label: "Pressure", data: press }]
+    }
+  });
+}
+
+function appendSampleToCharts(sample) {
+  const label = formatTime(sample.ts);
+
+  if (tempChart) {
+    tempChart.data.labels.push(label);
+    tempChart.data.datasets[0].data.push(sample.t);
+    tempChart.update();
+  }
+
+  if (humChart) {
+    humChart.data.labels.push(label);
+    humChart.data.datasets[0].data.push(sample.h);
+    humChart.update();
+  }
+
+  if (pressChart) {
+    pressChart.data.labels.push(label);
+    pressChart.data.datasets[0].data.push(sample.p);
+    pressChart.update();
+  }
+}
+
+/* ---------------- LIVE SAMPLE HANDLING ---------------- */
+
+function addLiveSample(sample) {
+  const normalized = {
+    ts: sample.ts,
+    t: Number(sample.t),
+    h: Number(sample.h),
+    p: Number(sample.p)
+  };
+
+  if (isNaN(normalized.t) || isNaN(normalized.h) || isNaN(normalized.p)) {
+    console.warn("Invalid live sample:", sample);
+    return;
+  }
+
+  sensorData.push(normalized);
+
+  updateLatest(sensorData);
+  updateExtremes(sensorData);
+  appendSampleToCharts(normalized);
+}
+
+/* ---------------- SSE ---------------- */
+
+function startSSE() {
+  eventSource = new EventSource("/events");
+
+  eventSource.addEventListener("sample", (e) => {
+    try {
+      const sample = JSON.parse(e.data);
+      addLiveSample(sample);
+    } catch (err) {
+      console.error("Failed to parse SSE sample:", err, e.data);
+    }
+  });
+
+  eventSource.onerror = (e) => {
+    console.error("SSE connection error", e);
+  };
+}
+
+/* ---------------- DEBUG: FILE LIST ---------------- */
+
+async function loadFiles() {
+  try {
+    const res = await fetch("/list_files");
+    const json = await res.json();
+
+    const select = document.getElementById("fileList");
+    select.innerHTML = "";
+
+    if (!Array.isArray(json.files)) {
+      console.error("json.files is not an array:", json.files);
+      return;
+    }
+
+    json.files.forEach(f => {
+      const opt = document.createElement("option");
+      opt.value = f;
+      opt.textContent = f;
+      select.appendChild(opt);
+    });
+  } catch (err) {
+    console.error("loadFiles failed:", err);
+  }
+}
+
+/* ---------------- DEBUG: FILE CONTENT ---------------- */
+
+async function loadFileContent() {
+  const file = document.getElementById("fileList").value;
+  if (!file) return;
+
+  try {
+    const res = await fetch("/get_file?filename=" + encodeURIComponent(file));
+    const text = await res.text();
+    document.getElementById("fileContent").value = text;
+  } catch (err) {
+    console.error("loadFileContent failed:", err);
+  }
+}
+
+/* ---------------- STARTUP ---------------- */
+
+async function initDashboard() {
+  try {
+    sensorData = await fetchData();
+
+    if (!sensorData.length) {
+      console.warn("No valid historical data after normalization");
+    } else {
+      updateLatest(sensorData);
+      updateExtremes(sensorData);
+      createCharts(sensorData);
+    }
+
+    await fetchNodeInfo();
+    startSSE();
+  } catch (err) {
+    console.error("initDashboard failed:", err);
+  }
+}
+
+initDashboard();
+
+</script>
+
+</body>
+</html>
