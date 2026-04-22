@@ -1,353 +1,569 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="UTF-8">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>ESP32 Sensor Dashboard</title>
-
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-
   <style>
-    body { font-family: Arial; margin: 20px; }
-    .top { display: flex; gap: 20px; margin-bottom: 20px; }
-    .card {
-      padding: 10px;
-      border: 1px solid #ccc;
-      border-radius: 8px;
-      min-width: 250px;
+    :root {
+      --bg: #f4f7fb;
+      --card: #ffffff;
+      --text: #1f2937;
+      --muted: #6b7280;
+      --border: #dbe3ee;
+      --accent: #2563eb;
+      --accent-soft: #dbeafe;
+      --ok: #059669;
+      --warn: #b45309;
+      --shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+      --radius: 16px;
     }
-    canvas { margin-top: 20px; max-width: 100%; }
-    textarea { width: 100%; height: 200px; margin-top: 10px; }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+
+    .title-group h1 {
+      margin: 0;
+      font-size: 2rem;
+    }
+
+    .title-group p {
+      margin: 6px 0 0;
+      color: var(--muted);
+    }
+
+    .nav-links {
+      display: flex;
+      gap: 10px;
+    }
+
+    .nav-links a {
+      text-decoration: none;
+      color: white;
+      background: var(--accent);
+      padding: 10px 14px;
+      border-radius: 10px;
+      font-size: 0.95rem;
+    }
+
+    .grid {
+      display: grid;
+      gap: 16px;
+    }
+
+    .grid.top {
+      grid-template-columns: repeat(4, minmax(220px, 1fr));
+      margin-bottom: 20px;
+    }
+
+    .grid.info {
+      grid-template-columns: repeat(5, minmax(160px, 1fr));
+      margin-bottom: 20px;
+    }
+
+    .charts {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: 1fr;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 18px;
+    }
+
+    .card h2,
+    .card h3 {
+      margin-top: 0;
+      margin-bottom: 12px;
+    }
+
+    .metric-label {
+      color: var(--muted);
+      font-size: 0.9rem;
+      margin-bottom: 6px;
+    }
+
+    .metric-value {
+      font-size: 1.8rem;
+      font-weight: bold;
+    }
+
+    .subtle {
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .node-item {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .node-item .label {
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .node-item .value {
+      font-weight: bold;
+      word-break: break-word;
+    }
+
+    .extreme-list {
+      display: grid;
+      gap: 12px;
+    }
+
+    .extreme-row {
+      padding: 10px 12px;
+      background: #f8fafc;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+    }
+
+    .extreme-row strong {
+      display: block;
+      margin-bottom: 4px;
+    }
+
+    .chart-card canvas {
+      width: 100% !important;
+      height: 320px !important;
+    }
+
+    .status-pill {
+      display: inline-block;
+      background: var(--accent-soft);
+      color: var(--accent);
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 0.85rem;
+      font-weight: bold;
+    }
+
+    @media (max-width: 1100px) {
+      .grid.top,
+      .grid.info {
+        grid-template-columns: repeat(2, minmax(220px, 1fr));
+      }
+    }
+
+    @media (max-width: 700px) {
+      .grid.top,
+      .grid.info {
+        grid-template-columns: 1fr;
+      }
+
+      .topbar {
+        align-items: flex-start;
+      }
+    }
   </style>
 </head>
-
 <body>
+  <div class="container">
+    <div class="topbar">
+      <div class="title-group">
+        <h1>ESP32 Sensor Dashboard</h1>
+        <p>Live and historical readings from the node</p>
+      </div>
+      <div class="nav-links">
+        <a href="./">Dashboard</a>
+        <a href="debug.html">Debug</a>
+      </div>
+    </div>
 
-<h2>ESP32 Sensor Dashboard</h2>
+    <div class="grid info">
+      <div class="card node-item">
+        <div class="label">Start Time</div>
+        <div class="value" id="starttime">-</div>
+      </div>
+      <div class="card node-item">
+        <div class="label">MAC Address</div>
+        <div class="value" id="macaddr">-</div>
+      </div>
+      <div class="card node-item">
+        <div class="label">IP Address</div>
+        <div class="value" id="ipaddr">-</div>
+      </div>
+      <div class="card node-item">
+        <div class="label">Hostname</div>
+        <div class="value" id="hostname">-</div>
+      </div>
+      <div class="card node-item">
+        <div class="label">WiFi SSID</div>
+        <div class="value" id="wifiStatus">-</div>
+      </div>
+    </div>
 
-<div class="top">
-  <div class="card">
-    <h3>Latest Reading</h3>
-    <div id="latest">Loading...</div>
+    <div class="grid top">
+      <div class="card">
+        <div class="metric-label">Latest Temperature</div>
+        <div class="metric-value" id="latestTemp">-</div>
+        <div class="subtle" id="latestTimeTemp">-</div>
+      </div>
+
+      <div class="card">
+        <div class="metric-label">Latest Humidity</div>
+        <div class="metric-value" id="latestHum">-</div>
+        <div class="subtle" id="latestTimeHum">-</div>
+      </div>
+
+      <div class="card">
+        <div class="metric-label">Latest Pressure</div>
+        <div class="metric-value" id="latestPress">-</div>
+        <div class="subtle" id="latestTimePress">-</div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-bottom:10px;">Status</h3>
+        <div class="status-pill" id="liveStatus">Connecting…</div>
+        <div class="subtle" style="margin-top:10px;">
+          Samples loaded: <span id="sampleCount">0</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:20px;">
+      <h3>Extreme Values</h3>
+      <div class="extreme-list" id="extremes">Loading…</div>
+    </div>
+
+    <div class="charts">
+      <div class="card chart-card">
+        <h3>Temperature</h3>
+        <canvas id="tempChart"></canvas>
+      </div>
+
+      <div class="card chart-card">
+        <h3>Humidity</h3>
+        <canvas id="humChart"></canvas>
+      </div>
+
+      <div class="card chart-card">
+        <h3>Air Pressure</h3>
+        <canvas id="pressChart"></canvas>
+      </div>
+    </div>
   </div>
 
-  <div class="card">
-    <h3>Extreme Values</h3>
-    <div id="extremes">Loading...</div>
-  </div>
-</div>
-
-<canvas id="tempChart"></canvas>
-<canvas id="humChart"></canvas>
-<canvas id="pressChart"></canvas>
-
-<hr>
-
-<h3>Debug Tools</h3>
-
-<button onclick="loadFiles()">Load Files</button>
-<select id="fileList"></select>
-<button onclick="loadFileContent()">View File</button>
-
 <script>
-function loadLog() {
-    fetch('/get_file?filename=data/log.txt')
-        .then(r => r.text())
-        .then(t => document.getElementById('log').textContent = t);
-}
-</script>
+  window.addEventListener("beforeunload", () => {
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+    }
+  });
 
-<form method="POST" action="/wifi_config">
-  SSID: <input name="ssid"><br>
-  Password: <input name="password" type="password"><br>
-  <button type="submit">Save</button>
-</form>
+  let tempChart, humChart, pressChart;
+  let sensorData = [];
+  let eventSource = null;
+  let sseConnected = false;
 
-<textarea id="fileContent" placeholder="File content will appear here..."></textarea>
+  function formatTime(ts) {
+    const d = new Date(ts);
+    if (isNaN(d.getTime())) return ts;
+    return d.getFullYear() + "-" +
+      String(d.getMonth() + 1).padStart(2, "0") + "-" +
+      String(d.getDate()).padStart(2, "0") + " " +
+      String(d.getHours()).padStart(2, "0") + ":" +
+      String(d.getMinutes()).padStart(2, "0") + ":" +
+      String(d.getSeconds()).padStart(2, "0");
+  }
 
+  function normalizeSample(sample) {
+    return {
+      ts: sample.ts,
+      t: Number(sample.t),
+      h: Number(sample.h),
+      p: Number(sample.p)
+    };
+  }
 
-  <h1>ESP32 Status</h1>
-  <p>Start Time: <span id="starttime">-</span></p>
-  <p>MAC Address: <span id="macaddr">-</span></p>
-  <p>IP Address: <span id="ipaddr">-</span></p>
-  <p>Hostname: <span id="hostname">-</span></p>
-  <p>WiFi SSID: <span id="wifiStatus">-</span></p>
+  function isValidSample(sample) {
+    return sample &&
+      typeof sample.ts === "string" &&
+      !isNaN(sample.t) &&
+      !isNaN(sample.h) &&
+      !isNaN(sample.p);
+  }
 
-  <script>
-    async function fetchNodeInfo() {
-    const res = await fetch("/get_node");
+  function isSameSample(a, b) {
+    return !!a && !!b &&
+      a.ts === b.ts &&
+      Number(a.t) === Number(b.t) &&
+      Number(a.h) === Number(b.h) &&
+      Number(a.p) === Number(b.p);
+  }
+
+  async function fetchData() {
+    const res = await fetch("data");
+    if (!res.ok) throw new Error(`fetchData failed: HTTP ${res.status}`);
+
     const json = await res.json();
+    if (!json.data) return [];
 
-    if (!json.node) return [];
-    document.getElementById("starttime").textContent = json.node.starttime || "-";
-    document.getElementById("macaddr").textContent = json.node.mac || "-";
-    document.getElementById("ipaddr").textContent = json.node.ip || "-";
-    document.getElementById("hostname").textContent = json.node.name || "-";
-    document.getElementById("wifiStatus").textContent = json.node.ssid || "-";
-    }
-  </script>
-
-
-<script>
-
-let tempChart, humChart, pressChart;
-let sensorData = [];
-let eventSource = null;
-
-/* ---------------- FETCH DATA ---------------- */
-
-async function fetchData() {
-  const res = await fetch("/data");
-  const json = await res.json();
-
-  if (!json.data) return [];
-
-  return json.data
-    .map(d => ({
-      ts: d.ts,
-      t: Number(d.t),
-      h: Number(d.h),
-      p: Number(d.p)
-    }))
-    .filter(d => !isNaN(d.t) && !isNaN(d.h) && !isNaN(d.p));
-}
-
-/* ---------------- NODE INFO ---------------- */
-
-async function fetchNodeInfo() {
-  try {
-    const res = await fetch("/get_node");
-    const json = await res.json();
-
-    if (!json.node) return;
-
-    document.getElementById("starttime").textContent = json.node.starttime || "-";
-    document.getElementById("macaddr").textContent = json.node.mac || "-";
-    document.getElementById("ipaddr").textContent = json.node.ip || "-";
-    document.getElementById("hostname").textContent = json.node.name || "-";
-    document.getElementById("wifiStatus").textContent = json.node.ssid || "-";
-  } catch (err) {
-    console.error("fetchNodeInfo failed:", err);
-  }
-}
-
-/* ---------------- FORMAT TIME ---------------- */
-
-function formatTime(ts) {
-  const d = new Date(ts);
-  return d.getFullYear() + "-" +
-    String(d.getMonth() + 1).padStart(2, '0') + "-" +
-    String(d.getDate()).padStart(2, '0') + " " +
-    String(d.getHours()).padStart(2, '0') + ":" +
-    String(d.getMinutes()).padStart(2, '0') + ":" +
-    String(d.getSeconds()).padStart(2, '0');
-}
-
-/* ---------------- UPDATE UI ---------------- */
-
-function updateLatest(data) {
-  if (!data.length) return;
-
-  const last = data[data.length - 1];
-
-  document.getElementById("latest").innerHTML = `
-    <b>Time:</b> ${formatTime(last.ts)}<br>
-    <b>Temp:</b> ${last.t.toFixed(1)} °C<br>
-    <b>Humidity:</b> ${last.h.toFixed(1)} %<br>
-    <b>Pressure:</b> ${last.p.toFixed(1)} hPa
-  `;
-}
-
-function updateExtremes(data) {
-  if (!data.length) return;
-
-  let minT = data[0], maxT = data[0];
-  let minH = data[0], maxH = data[0];
-  let minP = data[0], maxP = data[0];
-
-  data.forEach(d => {
-    if (d.t < minT.t) minT = d;
-    if (d.t > maxT.t) maxT = d;
-    if (d.h < minH.h) minH = d;
-    if (d.h > maxH.h) maxH = d;
-    if (d.p < minP.p) minP = d;
-    if (d.p > maxP.p) maxP = d;
-  });
-
-  document.getElementById("extremes").innerHTML = `
-    <b>Temp:</b> min ${minT.t.toFixed(1)} (${formatTime(minT.ts)})
-    / max ${maxT.t.toFixed(1)} (${formatTime(maxT.ts)})<br>
-    <b>Humidity:</b> min ${minH.h.toFixed(1)} (${formatTime(minH.ts)})
-    / max ${maxH.h.toFixed(1)} (${formatTime(maxH.ts)})<br>
-    <b>Pressure:</b> min ${minP.p.toFixed(1)} (${formatTime(minP.ts)})
-    / max ${maxP.p.toFixed(1)} (${formatTime(maxP.ts)})
-  `;
-}
-
-/* ---------------- CHARTS ---------------- */
-
-function createCharts(data) {
-  const labels = data.map(d => formatTime(d.ts));
-  const temp = data.map(d => d.t);
-  const hum = data.map(d => d.h);
-  const press = data.map(d => d.p);
-
-  if (tempChart) tempChart.destroy();
-  if (humChart) humChart.destroy();
-  if (pressChart) pressChart.destroy();
-
-  tempChart = new Chart(document.getElementById("tempChart"), {
-    type: "line",
-    data: {
-      labels,
-      datasets: [{ label: "Temp", data: temp }]
-    }
-  });
-
-  humChart = new Chart(document.getElementById("humChart"), {
-    type: "line",
-    data: {
-      labels,
-      datasets: [{ label: "Humidity", data: hum }]
-    }
-  });
-
-  pressChart = new Chart(document.getElementById("pressChart"), {
-    type: "line",
-    data: {
-      labels,
-      datasets: [{ label: "Pressure", data: press }]
-    }
-  });
-}
-
-function appendSampleToCharts(sample) {
-  const label = formatTime(sample.ts);
-
-  if (tempChart) {
-    tempChart.data.labels.push(label);
-    tempChart.data.datasets[0].data.push(sample.t);
-    tempChart.update();
+    return json.data
+      .map(normalizeSample)
+      .filter(isValidSample)
+      .sort((a, b) => new Date(a.ts) - new Date(b.ts));
   }
 
-  if (humChart) {
-    humChart.data.labels.push(label);
-    humChart.data.datasets[0].data.push(sample.h);
-    humChart.update();
-  }
-
-  if (pressChart) {
-    pressChart.data.labels.push(label);
-    pressChart.data.datasets[0].data.push(sample.p);
-    pressChart.update();
-  }
-}
-
-/* ---------------- LIVE SAMPLE HANDLING ---------------- */
-
-function addLiveSample(sample) {
-  const normalized = {
-    ts: sample.ts,
-    t: Number(sample.t),
-    h: Number(sample.h),
-    p: Number(sample.p)
-  };
-
-  if (isNaN(normalized.t) || isNaN(normalized.h) || isNaN(normalized.p)) {
-    console.warn("Invalid live sample:", sample);
-    return;
-  }
-
-  sensorData.push(normalized);
-
-  updateLatest(sensorData);
-  updateExtremes(sensorData);
-  appendSampleToCharts(normalized);
-}
-
-/* ---------------- SSE ---------------- */
-
-function startSSE() {
-  eventSource = new EventSource("/events");
-
-  eventSource.addEventListener("sample", (e) => {
+  async function fetchNodeInfo() {
     try {
-      const sample = JSON.parse(e.data);
-      addLiveSample(sample);
+      const res = await fetch("get_node");
+      if (!res.ok) throw new Error(`fetchNodeInfo failed: HTTP ${res.status}`);
+
+      const json = await res.json();
+      if (!json.node) return;
+
+      document.getElementById("starttime").textContent = json.node.starttime || "-";
+      document.getElementById("macaddr").textContent = json.node.mac || "-";
+      document.getElementById("ipaddr").textContent = json.node.ip || "-";
+      document.getElementById("hostname").textContent = json.node.name || "-";
+      document.getElementById("wifiStatus").textContent = json.node.ssid || "-";
     } catch (err) {
-      console.error("Failed to parse SSE sample:", err, e.data);
+      console.error("fetchNodeInfo failed:", err);
     }
-  });
+  }
 
-  eventSource.onerror = (e) => {
-    console.error("SSE connection error", e);
-  };
-}
+  function updateLatest(data) {
+    if (!data.length) return;
 
-/* ---------------- DEBUG: FILE LIST ---------------- */
+    const last = data[data.length - 1];
+    const timeText = formatTime(last.ts);
 
-async function loadFiles() {
-  try {
-    const res = await fetch("/list_files");
-    const json = await res.json();
+    document.getElementById("latestTemp").textContent = `${last.t.toFixed(1)} °C`;
+    document.getElementById("latestHum").textContent = `${last.h.toFixed(1)} %`;
+    document.getElementById("latestPress").textContent = `${last.p.toFixed(1)} hPa`;
 
-    const select = document.getElementById("fileList");
-    select.innerHTML = "";
+    document.getElementById("latestTimeTemp").textContent = timeText;
+    document.getElementById("latestTimeHum").textContent = timeText;
+    document.getElementById("latestTimePress").textContent = timeText;
 
-    if (!Array.isArray(json.files)) {
-      console.error("json.files is not an array:", json.files);
+    document.getElementById("sampleCount").textContent = data.length;
+  }
+
+  function updateExtremes(data) {
+    if (!data.length) return;
+
+    let minT = data[0], maxT = data[0];
+    let minH = data[0], maxH = data[0];
+    let minP = data[0], maxP = data[0];
+
+    for (const d of data) {
+      if (d.t < minT.t) minT = d;
+      if (d.t > maxT.t) maxT = d;
+      if (d.h < minH.h) minH = d;
+      if (d.h > maxH.h) maxH = d;
+      if (d.p < minP.p) minP = d;
+      if (d.p > maxP.p) maxP = d;
+    }
+
+    document.getElementById("extremes").innerHTML = `
+      <div class="extreme-row">
+        <strong>Temperature</strong>
+        Min: ${minT.t.toFixed(1)} °C at ${formatTime(minT.ts)}<br>
+        Max: ${maxT.t.toFixed(1)} °C at ${formatTime(maxT.ts)}
+      </div>
+      <div class="extreme-row">
+        <strong>Humidity</strong>
+        Min: ${minH.h.toFixed(1)} % at ${formatTime(minH.ts)}<br>
+        Max: ${maxH.h.toFixed(1)} % at ${formatTime(maxH.ts)}
+      </div>
+      <div class="extreme-row">
+        <strong>Air Pressure</strong>
+        Min: ${minP.p.toFixed(1)} hPa at ${formatTime(minP.ts)}<br>
+        Max: ${maxP.p.toFixed(1)} hPa at ${formatTime(maxP.ts)}
+      </div>
+    `;
+  }
+
+  function buildChart(canvasId, label, data, yTitle) {
+    return new Chart(document.getElementById(canvasId), {
+      type: "line",
+      data: {
+        labels: sensorData.map(d => formatTime(d.ts)),
+        datasets: [{
+          label,
+          data,
+          pointRadius: 0
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        interaction: {
+          mode: "index",
+          intersect: false
+        },
+        plugins: {
+          legend: {
+            display: true
+          }
+        },
+        scales: {
+          x: {
+            ticks: {
+              maxTicksLimit: 10
+            }
+          },
+          y: {
+            title: {
+              display: true,
+              text: yTitle
+            }
+          }
+        }
+      }
+    });
+  }
+
+  function createCharts() {
+    if (tempChart) tempChart.destroy();
+    if (humChart) humChart.destroy();
+    if (pressChart) pressChart.destroy();
+
+    tempChart = buildChart("tempChart", "Temperature", sensorData.map(d => d.t), "°C");
+    humChart = buildChart("humChart", "Humidity", sensorData.map(d => d.h), "%");
+    pressChart = buildChart("pressChart", "Air Pressure", sensorData.map(d => d.p), "hPa");
+  }
+
+  function refreshCharts() {
+    const labels = sensorData.map(d => formatTime(d.ts));
+
+    if (tempChart) {
+      tempChart.data.labels = labels;
+      tempChart.data.datasets[0].data = sensorData.map(d => d.t);
+      tempChart.update();
+    }
+
+    if (humChart) {
+      humChart.data.labels = labels;
+      humChart.data.datasets[0].data = sensorData.map(d => d.h);
+      humChart.update();
+    }
+
+    if (pressChart) {
+      pressChart.data.labels = labels;
+      pressChart.data.datasets[0].data = sensorData.map(d => d.p);
+      pressChart.update();
+    }
+  }
+
+  function setLiveStatus(text) {
+    document.getElementById("liveStatus").textContent = text;
+  }
+
+  function addLiveSample(sample) {
+    const normalized = normalizeSample(sample);
+
+    if (!isValidSample(normalized)) {
+      console.warn("Invalid live sample:", sample);
       return;
     }
 
-    json.files.forEach(f => {
-      const opt = document.createElement("option");
-      opt.value = f;
-      opt.textContent = f;
-      select.appendChild(opt);
-    });
-  } catch (err) {
-    console.error("loadFiles failed:", err);
-  }
-}
-
-/* ---------------- DEBUG: FILE CONTENT ---------------- */
-
-async function loadFileContent() {
-  const file = document.getElementById("fileList").value;
-  if (!file) return;
-
-  try {
-    const res = await fetch("/get_file?filename=" + encodeURIComponent(file));
-    const text = await res.text();
-    document.getElementById("fileContent").value = text;
-  } catch (err) {
-    console.error("loadFileContent failed:", err);
-  }
-}
-
-/* ---------------- STARTUP ---------------- */
-
-async function initDashboard() {
-  try {
-    sensorData = await fetchData();
-
-    if (!sensorData.length) {
-      console.warn("No valid historical data after normalization");
-    } else {
-      updateLatest(sensorData);
-      updateExtremes(sensorData);
-      createCharts(sensorData);
+    const last = sensorData.length ? sensorData[sensorData.length - 1] : null;
+    if (isSameSample(last, normalized)) {
+      return;
     }
 
-    await fetchNodeInfo();
-    startSSE();
-  } catch (err) {
-    console.error("initDashboard failed:", err);
+    sensorData.push(normalized);
+    sensorData.sort((a, b) => new Date(a.ts) - new Date(b.ts));
+
+    updateLatest(sensorData);
+    updateExtremes(sensorData);
+    refreshCharts();
   }
-}
 
-initDashboard();
+  function startSSE() {
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+    }
 
+    sseConnected = false;
+    setLiveStatus("Connecting…");
+
+    eventSource = new EventSource("events");
+
+    eventSource.addEventListener("sample", (e) => {
+      try {
+        const sample = JSON.parse(e.data);
+        addLiveSample(sample);
+
+        if (!sseConnected) {
+          sseConnected = true;
+          setLiveStatus("Live");
+        }
+      } catch (err) {
+        console.error("Failed to parse SSE sample:", err, e.data);
+      }
+    });
+
+    eventSource.onopen = () => {
+      sseConnected = true;
+      setLiveStatus("Live");
+    };
+
+    eventSource.onerror = (e) => {
+      sseConnected = false;
+      console.error("SSE connection error", e);
+      setLiveStatus("Reconnecting…");
+    };
+  }
+
+  async function initDashboard() {
+    try {
+      await fetchNodeInfo();
+      sensorData = await fetchData();
+
+      if (sensorData.length) {
+        updateLatest(sensorData);
+        updateExtremes(sensorData);
+        createCharts();
+      } else {
+        document.getElementById("extremes").textContent = "No data available.";
+        setLiveStatus("Waiting for data");
+        createCharts();
+      }
+
+      startSSE();
+    } catch (err) {
+      console.error("initDashboard failed:", err);
+      setLiveStatus("Error");
+    }
+  }
+
+  initDashboard();
+  setInterval(fetchNodeInfo, 30000);
 </script>
-
 </body>
 </html>

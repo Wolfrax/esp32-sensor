@@ -5,35 +5,38 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <assert.h>
+#include <stdlib.h>
 
 #include "esp_sntp.h"
 #include "esp_system.h"
 #include "esp_mac.h"
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_random.h"
-
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "nvs_flash.h"
 #include "esp_netif.h"
-
 #include "esp_http_server.h"
-
 #include "esp_vfs_fat.h"
 #include "wear_levelling.h"
-
 #include "nvs.h"
-
 #include "mdns.h"
+#include "i2c_reader.h"
+
 
 /* ---------------- CONFIG ---------------- */
 
 #define STORAGE_PATH "/storage"
 #define MAX_SAMPLES 128
+#define SIMULATE_SENSOR 0
+#define LOG_WEB_BUF_SIZE 8192
+#define LOG_WEB_TMP_LINE 256
 
 /* ---------------- GLOBALS ---------------- */
 
@@ -44,15 +47,11 @@ static char ip_str[16] = "UNKNOWN";
 static char hostname[32] = "UNKNOWN";
 static httpd_handle_t server = NULL;
 static char starttime_str[64] = "UNKNOWN";
-
-// SSE (Server Side Events)
-typedef struct {
-    char event[32];
-    char data[128];
-} sse_msg_t;
-
-static QueueHandle_t sse_queue = NULL;
-static int sse_fd = -1;
+static char log_web_buf[LOG_WEB_BUF_SIZE];
+static size_t log_web_head = 0;
+static bool log_web_wrapped = false;
+static SemaphoreHandle_t log_web_mutex = NULL;
+static vprintf_like_t log_old_vprintf = NULL;
 
 /* ---------------- SAMPLE STRUCT ---------------- */
 
@@ -61,111 +60,318 @@ typedef struct {
     float t, h, p;
 } sample_t;
 
-__attribute__((unused)) static sample_t samples[MAX_SAMPLES];
-__attribute__((unused)) static int sample_count = 0;
+/* ---------------- SSE ---------------- */
+
+#define MAX_SSE_CLIENTS 4
+#define SSE_KEEPALIVE_SEC 20
+
+typedef struct {
+    bool active;
+    int sockfd;
+    httpd_req_t *req_async;
+    uint32_t last_sent_seq;
+} sse_client_t;
+
+typedef struct {
+    int client_index;
+    bool is_keepalive;
+    sample_t sample;
+    uint32_t seq;
+} sse_work_t;
+
+static sse_client_t sse_clients[MAX_SSE_CLIENTS];
+static SemaphoreHandle_t sse_clients_mutex = NULL;
+
+static sample_t latest_sample = {0};
+static uint32_t latest_sample_seq = 0;
+static SemaphoreHandle_t sample_mutex = NULL;
+
+/* ---------------- WEB LOG BUFFER ---------------- */
+
+static void log_web_append(const char *s, size_t len)
+{
+    if (len == 0) return;
+
+    // If one message is larger than the whole buffer, keep only the tail
+    if (len >= LOG_WEB_BUF_SIZE) {
+        s += (len - (LOG_WEB_BUF_SIZE - 1));
+        len = LOG_WEB_BUF_SIZE - 1;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        log_web_buf[log_web_head] = s[i];
+        log_web_head = (log_web_head + 1) % LOG_WEB_BUF_SIZE;
+
+        if (log_web_head == 0) {
+            log_web_wrapped = true;
+        }
+    }
+}
+
+static int log_web_vprintf(const char *fmt, va_list ap)
+{
+    char tmp[LOG_WEB_TMP_LINE];
+
+    // Format once for the web buffer
+    va_list ap_copy;
+    va_copy(ap_copy, ap);
+    int n = vsnprintf(tmp, sizeof(tmp), fmt, ap_copy);
+    va_end(ap_copy);
+
+    if (n > 0 && log_web_mutex != NULL) {
+        size_t len = (n < (int)sizeof(tmp)) ? (size_t)n : (sizeof(tmp) - 1);
+
+        if (xSemaphoreTake(log_web_mutex, 0) == pdTRUE) {
+            log_web_append(tmp, len);
+            xSemaphoreGive(log_web_mutex);
+        }
+    }
+
+    // Still send logs to the normal output (monitor/UART)
+    if (log_old_vprintf) {
+        return log_old_vprintf(fmt, ap);
+    }
+
+    return n;
+}
+
+static void init_web_log_buffer(void)
+{
+    log_web_mutex = xSemaphoreCreateMutex();
+    assert(log_web_mutex != NULL);
+
+    log_old_vprintf = esp_log_set_vprintf(log_web_vprintf);
+}
 
 /* ---------------- SSE ---------------- */
 
+static int sse_find_free_slot_locked(void)
+{
+    for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
+        if (!sse_clients[i].active) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void sse_remove_client_locked(int idx)
+{
+    if (idx < 0 || idx >= MAX_SSE_CLIENTS || !sse_clients[idx].active) {
+        return;
+    }
+
+    httpd_req_t *req_async = sse_clients[idx].req_async;
+    int sockfd = sse_clients[idx].sockfd;
+
+    sse_clients[idx].active = false;
+    sse_clients[idx].sockfd = -1;
+    sse_clients[idx].req_async = NULL;
+    sse_clients[idx].last_sent_seq = 0;
+
+    if (server != NULL && sockfd >= 0) {
+        httpd_sess_trigger_close(server, sockfd);
+    }
+
+    if (req_async != NULL) {
+        httpd_req_async_handler_complete(req_async);
+    }
+}
+
+static void sse_send_work(void *arg)
+{
+    sse_work_t *work = (sse_work_t *)arg;
+    if (work == NULL) {
+        return;
+    }
+
+    if (xSemaphoreTake(sse_clients_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        free(work);
+        return;
+    }
+
+    int idx = work->client_index;
+    if (idx < 0 || idx >= MAX_SSE_CLIENTS || !sse_clients[idx].active) {
+        xSemaphoreGive(sse_clients_mutex);
+        free(work);
+        return;
+    }
+
+    httpd_req_t *req = sse_clients[idx].req_async;
+    esp_err_t err = ESP_FAIL;
+
+    if (req == NULL) {
+        sse_remove_client_locked(idx);
+        xSemaphoreGive(sse_clients_mutex);
+        free(work);
+        return;
+    }
+
+    if (work->is_keepalive) {
+        err = httpd_resp_send_chunk(req, ": keepalive\n\n", HTTPD_RESP_USE_STRLEN);
+    } else {
+        char buf[192];
+        int len = snprintf(buf, sizeof(buf),
+                           "event: sample\n"
+                           "data: {\"ts\":\"%s\",\"t\":%.2f,\"h\":%.2f,\"p\":%.2f}\n\n",
+                           work->sample.ts, work->sample.t, work->sample.h, work->sample.p);
+
+        if (len > 0 && len < (int)sizeof(buf)) {
+            err = httpd_resp_send_chunk(req, buf, len);
+        } else {
+            err = ESP_FAIL;
+        }
+
+        if (err == ESP_OK) {
+            sse_clients[idx].last_sent_seq = work->seq;
+        }
+    }
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "SSE send failed for client %d, removing", idx);
+        sse_remove_client_locked(idx);
+    }
+
+    xSemaphoreGive(sse_clients_mutex);
+    free(work);
+}
+
+static void sse_broadcast_task(void *arg)
+{
+    uint32_t last_global_seq_seen = 0;
+    int keepalive_counter = 0;
+
+    while (1) {
+        sample_t s = {0};
+        uint32_t seq = 0;
+
+        if (xSemaphoreTake(sample_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            seq = latest_sample_seq;
+            s = latest_sample;
+            xSemaphoreGive(sample_mutex);
+        }
+
+        bool have_new_sample = (seq != 0 && seq != last_global_seq_seen);
+
+        keepalive_counter++;
+        bool do_keepalive = (keepalive_counter >= SSE_KEEPALIVE_SEC);
+        if (do_keepalive) {
+            keepalive_counter = 0;
+        }
+
+        if (have_new_sample || do_keepalive) {
+            if (xSemaphoreTake(sse_clients_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
+                    if (!sse_clients[i].active) {
+                        continue;
+                    }
+
+                    if (have_new_sample && sse_clients[i].last_sent_seq == seq) {
+                        continue;
+                    }
+
+                    sse_work_t *work = calloc(1, sizeof(sse_work_t));
+                    if (work == NULL) {
+                        continue;
+                    }
+
+                    work->client_index = i;
+                    work->is_keepalive = !have_new_sample;
+                    work->sample = s;
+                    work->seq = seq;
+
+                    esp_err_t err = httpd_queue_work(server, sse_send_work, work);
+                    if (err != ESP_OK) {
+                        ESP_LOGW(TAG, "httpd_queue_work failed for client %d", i);
+                        free(work);
+                    }
+                }
+                xSemaphoreGive(sse_clients_mutex);
+            }
+        }
+
+        if (have_new_sample) {
+            last_global_seq_seen = seq;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
 static esp_err_t events_handler(httpd_req_t *req)
 {
-    httpd_resp_set_type(req, "text/event-stream");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
-    httpd_resp_set_hdr(req, "Connection", "keep-alive");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-
-    ESP_LOGI(TAG, "SSE client connected");
-
-    sample_t s;
-
-    while (1) {
-        if (xQueueReceive(sse_queue, &s, pdMS_TO_TICKS(15000)) == pdPASS) {
-            char buf[192];
-            int len = snprintf(buf, sizeof(buf),
-                               "event: sample\n"
-                               "data: {\"ts\":\"%s\",\"t\":%.2f,\"h\":%.2f,\"p\":%.2f}\n\n",
-                               s.ts, s.t, s.h, s.p);
-
-            if (len < 0 || len >= sizeof(buf)) {
-                ESP_LOGE(TAG, "SSE message truncated");
-                continue;
-            }
-
-            esp_err_t err = httpd_resp_send_chunk(req, buf, HTTPD_RESP_USE_STRLEN);
-            if (err != ESP_OK) {
-                ESP_LOGW(TAG, "SSE send failed, client disconnected");
-                break;
-            }
-        } else {
-            esp_err_t err = httpd_resp_send_chunk(req, ": keepalive\n\n", HTTPD_RESP_USE_STRLEN);
-            if (err != ESP_OK) {
-                ESP_LOGW(TAG, "SSE keepalive failed, client disconnected");
-                break;
-            }
-        }
-    }
-
-    httpd_resp_send_chunk(req, NULL, 0);
-    return ESP_OK;
-}
-
-__attribute__((unused)) static esp_err_t OLD_events_handler(httpd_req_t *req)
-{
-    httpd_resp_set_type(req, "text/event-stream");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
-    httpd_resp_set_hdr(req, "Connection", "keep-alive");
-
-    sse_fd = httpd_req_to_sockfd(req);
-    ESP_LOGI(TAG, "SSE connected fd=%d", sse_fd);
-
-    while (sse_fd >= 0) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        if (httpd_resp_send_chunk(req, ": keepalive\n\n", HTTPD_RESP_USE_STRLEN) != ESP_OK) {
-            sse_fd = -1;
-            ESP_LOGE(TAG, "SSE connection lost, stopping keepalive");
-            break;
-        }
-    }
-
-    httpd_resp_send_chunk(req, NULL, 0);
-    return ESP_OK;
-}
-
-__attribute__((unused)) static esp_err_t sse_send_event(httpd_handle_t server, int fd, const char *event, const char *data)
-{
-    if (fd < 0) {
+    if (sse_clients_mutex == NULL || sample_mutex == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SSE not initialized");
         return ESP_FAIL;
     }
 
-    char buf[256];
-    int len = snprintf(buf, sizeof(buf), "event: %s\ndata: %s\n\n", event, data);
-    ESP_LOGI(TAG, "Sending SSE: %s", buf);
-    if (len < 0 || len >= sizeof(buf)) {
-        ESP_LOGE(TAG, "SSE message truncated, not sending");
+    // Check capacity before starting async handling
+    if (xSemaphoreTake(sse_clients_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_send(req, "SSE busy", HTTPD_RESP_USE_STRLEN);
         return ESP_FAIL;
     }
 
-    if (httpd_socket_send(server, fd, buf, len, 0) < 0) {
-        ESP_LOGE(TAG, "Failed to send SSE message");
+    int free_idx = sse_find_free_slot_locked();
+    xSemaphoreGive(sse_clients_mutex);
+
+    if (free_idx < 0) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_send(req, "Too many SSE clients", HTTPD_RESP_USE_STRLEN);
         return ESP_FAIL;
     }
 
-    return ESP_OK;
-}
+    httpd_req_t *async_req = NULL;
+    esp_err_t err = httpd_req_async_handler_begin(req, &async_req);
+    if (err != ESP_OK || async_req == NULL) {
+        ESP_LOGE(TAG, "httpd_req_async_handler_begin failed: %s", esp_err_to_name(err));
+        return ESP_FAIL;
+    }
 
-__attribute__((unused)) static void sse_task(void *arg)
-{
-    sse_msg_t msg;
+    httpd_resp_set_type(async_req, "text/event-stream");
+    httpd_resp_set_hdr(async_req, "Cache-Control", "no-cache");
+    httpd_resp_set_hdr(async_req, "Connection", "keep-alive");
+    httpd_resp_set_hdr(async_req, "Access-Control-Allow-Origin", "*");
 
-    while (1) {
-        if (xQueueReceive(sse_queue, &msg, portMAX_DELAY)) {
-            if (sse_fd >= 0) {
-                if (sse_send_event(server, sse_fd, msg.event, msg.data) != ESP_OK) {
-                    ESP_LOGE(TAG, "Failed to send SSE");
-                    sse_fd = -1;
-                }
-            }
+    int sockfd = httpd_req_to_sockfd(req);
+    if (sockfd < 0) {
+        httpd_req_async_handler_complete(async_req);
+        return ESP_OK;
+    }
+
+    if (xSemaphoreTake(sse_clients_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        httpd_req_async_handler_complete(async_req);
+        return ESP_OK;
+    }
+
+    int idx = sse_find_free_slot_locked();
+    if (idx < 0) {
+        xSemaphoreGive(sse_clients_mutex);
+        httpd_req_async_handler_complete(async_req);
+        return ESP_OK;
+    }
+
+    sse_clients[idx].active = true;
+    sse_clients[idx].sockfd = sockfd;
+    sse_clients[idx].req_async = async_req;
+    sse_clients[idx].last_sent_seq = 0;
+
+    xSemaphoreGive(sse_clients_mutex);
+
+    // Send initial comment so headers/stream are established immediately
+    err = httpd_resp_send_chunk(async_req, ": connected\n\n", HTTPD_RESP_USE_STRLEN);
+    if (err != ESP_OK) {
+        if (xSemaphoreTake(sse_clients_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            sse_remove_client_locked(idx);
+            xSemaphoreGive(sse_clients_mutex);
         }
+        return ESP_OK;
     }
+
+    ESP_LOGI(TAG, "SSE client connected, slot=%d sockfd=%d", idx, sockfd);
+    return ESP_OK;
 }
 
 /* ---------------- WIFI EVENT HANDLER ---------------- */
@@ -229,16 +435,20 @@ static void wifi_init_base(void)
 
 static void wifi_start_sta(const char *ssid, const char *pass)
 {
-    strncpy(current_ssid, ssid, sizeof(current_ssid));
+    strncpy(current_ssid, ssid, sizeof(current_ssid) - 1);
+    current_ssid[sizeof(current_ssid) - 1] = '\0';
 
     wifi_config_t wifi_config = { 0 };
-    strcpy((char *)wifi_config.sta.ssid, ssid);
-    strcpy((char *)wifi_config.sta.password, pass);
+    snprintf((char *)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), "%s", ssid);
+    snprintf((char *)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%s", pass);
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_connect());
+
+    ESP_LOGI(TAG, "Connecting to WiFi SSID: %s", ssid);
 }
 
 static void wifi_start_ap(void)
@@ -259,9 +469,7 @@ static void wifi_start_ap(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
-/* ---------------- NVS ---------------- */
-
-__attribute__((unused)) static void save_wifi_config(const char *ssid, const char *pass)
+static void save_wifi_config(const char *ssid, const char *pass)
 {
     nvs_handle_t nvs;
     nvs_open("wifi", NVS_READWRITE, &nvs);
@@ -269,6 +477,59 @@ __attribute__((unused)) static void save_wifi_config(const char *ssid, const cha
     nvs_set_str(nvs, "pass", pass);
     nvs_commit(nvs);
     nvs_close(nvs);
+}
+
+static esp_err_t wifi_setup_handler(httpd_req_t *req)
+{
+    char buf[128];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No body");
+        return ESP_FAIL;
+    }
+    buf[len] = '\0';
+
+    char ssid[32] = {0};
+    char pass[64] = {0};
+
+    if (httpd_query_key_value(buf, "ssid", ssid, sizeof(ssid)) != ESP_OK ||
+        httpd_query_key_value(buf, "pass", pass, sizeof(pass)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing ssid or pass");
+        return ESP_FAIL;
+    }
+
+    save_wifi_config(ssid, pass);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"WiFi config saved, rebooting\"}");
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+
+    return ESP_OK;
+}
+
+static esp_err_t wifi_reset_handler(httpd_req_t *req)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("wifi", NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS open failed");
+        return ESP_FAIL;
+    }
+
+    nvs_erase_key(nvs, "ssid");
+    nvs_erase_key(nvs, "pass");
+    nvs_commit(nvs);
+    nvs_close(nvs);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"WiFi config erased, rebooting\"}");
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+
+    return ESP_OK;
 }
 
 static bool load_wifi_config(char *ssid, size_t ssid_len,
@@ -290,9 +551,11 @@ static bool load_wifi_config(char *ssid, size_t ssid_len,
 
 /* ---------------- SENSOR ---------------- */
 
+#if SIMULATE_SENSOR
 static float get_temperature() { return 20 + (esp_random() % 100) / 10.0; }
 static float get_humidity()    { return 40 + (esp_random() % 200) / 10.0; }
 static float get_pressure()    { return 1000 + (esp_random() % 100); }
+#endif
 
 /* ---------------- FILE ---------------- */
 
@@ -341,6 +604,8 @@ static void cleanup_files(void)
 
 static void sampling_task(void *arg)
 {
+    esp_err_t err;
+
     while (1) {
         sample_t s;
 
@@ -352,9 +617,16 @@ static void sampling_task(void *arg)
 
         strftime(s.ts, sizeof(s.ts), "%Y-%m-%dT%H:%M:%SZ", &tinfo);
 
+#if SIMULATE_SENSOR
         s.t = get_temperature();
         s.h = get_humidity();
         s.p = get_pressure();
+#else
+        err = i2c_reader_read(&s.t, &s.h, &s.p);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Read failed: %s", esp_err_to_name(err));
+        }
+#endif
 
         char filename[32];
         strftime(filename, sizeof(filename), "%Y-%m-%d.csv", &tinfo);
@@ -362,13 +634,13 @@ static void sampling_task(void *arg)
         append_to_file(filename, &s);
         cleanup_files();
 
-        if (sse_queue != NULL) {
-            if (xQueueSend(sse_queue, &s, 0) != pdPASS) {
-                ESP_LOGW(TAG, "SSE queue full, dropping live sample");
-            }
-        }
+        if (xSemaphoreTake(sample_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            latest_sample = s;
+            latest_sample_seq++;
+            xSemaphoreGive(sample_mutex);
+        }      
 
-        vTaskDelay(pdMS_TO_TICKS(60000));
+        vTaskDelay(pdMS_TO_TICKS(10*60000));  // Sample every 10 minutes
     }
 }
 
@@ -405,8 +677,6 @@ static esp_err_t root_handler(httpd_req_t *req)
 
 static esp_err_t list_files_handler(httpd_req_t *req)
 {
-    ESP_LOGI("webserver", "LIST FILES handler called");
-
     DIR *dir = opendir(STORAGE_PATH "/data");
     if (!dir) return ESP_FAIL;
 
@@ -438,14 +708,6 @@ static esp_err_t list_files_handler(httpd_req_t *req)
 
 static esp_err_t data_handler(httpd_req_t *req)
 {
-    /* --- IGNORE ---
-    // Notify clients about the new IP via SSE
-    sse_msg_t msg = {0};
-    strlcpy(msg.event, "ip", sizeof(msg.event));
-    strlcpy(msg.data, ip_str, sizeof(msg.data));
-    xQueueSend(sse_queue, &msg, 0);
-    */
-
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr_chunk(req, "{ \"data\": [");
 
@@ -542,8 +804,6 @@ static esp_err_t get_node_handler(httpd_req_t *req)
 {
     // Return starttime, mac, ip_str, node name, and current SSID as JSON
     // Example response: { "node": { "starttime": "<starttime>", "mac": "<mac_address>", "ip": "<ip_address>", "name": "<node_name>", "ssid": "<ssid>" } }
-    
-    ESP_LOGI("webserver", "GET NODE handler called");
 
     httpd_resp_set_type(req, "application/json");
 
@@ -571,13 +831,63 @@ static esp_err_t get_node_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ---------------- LOGS ---------------- */
+
+static esp_err_t logs_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    if (log_web_mutex == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Log buffer not initialized");
+        return ESP_FAIL;
+    }
+
+    if (xSemaphoreTake(log_web_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Log buffer busy");
+        return ESP_FAIL;
+    }
+
+    if (!log_web_wrapped) {
+        esp_err_t err = httpd_resp_send(req, log_web_buf, log_web_head);
+        xSemaphoreGive(log_web_mutex);
+        return err;
+    }
+
+    esp_err_t err = httpd_resp_send_chunk(req,
+                                          &log_web_buf[log_web_head],
+                                          LOG_WEB_BUF_SIZE - log_web_head);
+    if (err == ESP_OK) {
+        err = httpd_resp_send_chunk(req, &log_web_buf[0], log_web_head);
+    }
+
+    xSemaphoreGive(log_web_mutex);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return httpd_resp_send_chunk(req, NULL, 0);
+}
+
+static esp_err_t debug_handler(httpd_req_t *req)
+{
+    return serve_file(req, STORAGE_PATH "/www/debug.html");
+}
+
 /* ---------------- SERVER ---------------- */
 
 static void start_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 12;
+    config.max_open_sockets = 10;
+    config.lru_purge_enable = true;
+    config.recv_wait_timeout = 2;
+    config.send_wait_timeout = 2;
 
-    httpd_start(&server, &config);
+    ESP_ERROR_CHECK(httpd_start(&server, &config));
 
     httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_handler };
     httpd_uri_t list = { .uri = "/list_files", .method = HTTP_GET, .handler = list_files_handler };
@@ -585,13 +895,21 @@ static void start_server(void)
     httpd_uri_t getf = { .uri = "/get_file", .method = HTTP_GET, .handler = get_file_handler };
     httpd_uri_t node = { .uri = "/get_node", .method = HTTP_GET, .handler = get_node_handler };
     httpd_uri_t events = { .uri = "/events", .method = HTTP_GET, .handler = events_handler };
+    httpd_uri_t wifi_setup = { .uri = "/wifi_setup", .method = HTTP_POST, .handler = wifi_setup_handler };
+    httpd_uri_t wifi_reset = { .uri = "/wifi_reset", .method = HTTP_POST, .handler = wifi_reset_handler };
+    httpd_uri_t logs = { .uri = "/logs", .method = HTTP_GET, .handler = logs_handler };
+    httpd_uri_t debug = { .uri = "/debug.html", .method = HTTP_GET, .handler = debug_handler };
 
-    httpd_register_uri_handler(server, &root);
-    httpd_register_uri_handler(server, &list);
-    httpd_register_uri_handler(server, &data);
-    httpd_register_uri_handler(server, &getf);
-    httpd_register_uri_handler(server, &node);
-    httpd_register_uri_handler(server, &events);
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &root));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &list));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &data));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &getf));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &node));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &events));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_setup));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_reset));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &logs));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &debug));
 }
 
 /* ---------------- TIME ---------------- */
@@ -624,8 +942,8 @@ static void obtain_time(void)
 static void init_fatfs(void)
 {
     const esp_vfs_fat_mount_config_t mount_config = {
-        .format_if_mount_failed = true,
-        .max_files = 5  // max nr of open files at the same time
+        .format_if_mount_failed = false,
+        .max_files = 10  // max nr of open files at the same time
     };
 
     esp_vfs_fat_spiflash_mount_rw_wl(
@@ -639,12 +957,12 @@ static void init_fatfs(void)
     mkdir(STORAGE_PATH "/www", 0775);
 }
 
-
 /* ---------------- MAIN ---------------- */
 
 void app_main(void)
 {
-    nvs_flash_init();
+    ESP_ERROR_CHECK(nvs_flash_init());
+    init_web_log_buffer();
 
     wifi_init_base();
 
@@ -660,17 +978,29 @@ void app_main(void)
     obtain_time();
     init_fatfs();
 
+    sample_mutex = xSemaphoreCreateMutex();
+    assert(sample_mutex != NULL);
+
+    sse_clients_mutex = xSemaphoreCreateMutex();
+    assert(sse_clients_mutex != NULL);
+
+    for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
+        sse_clients[i].active = false;
+        sse_clients[i].sockfd = -1;
+        sse_clients[i].req_async = NULL;
+        sse_clients[i].last_sent_seq = 0;
+    }
+
     start_server();
 
-    sse_queue = xQueueCreate(8, sizeof(sample_t));
-    assert(sse_queue != NULL);
+    esp_err_t err = i2c_reader_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Sensor init failed: %s", esp_err_to_name(err));
+        return;
+    }
 
     xTaskCreate(sampling_task, "sampling", 4096, NULL, 5, NULL);
-
-    //sse_queue = xQueueCreate(8, sizeof(sse_msg_t));
-    //xTaskCreate(sse_task, "sse_task", 4096, NULL, 5, NULL);
-    
-    //xTaskCreate(sampling_task, "sampling", 4096, NULL, 5, NULL);
+    xTaskCreate(sse_broadcast_task, "sse_broadcast", 4096, NULL, 4, NULL);
 
     ESP_LOGI(TAG, "%s ready", hostname);
 }

@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ESP32 Debug</title>
+  <style>
+    :root {
+      --bg: #f4f7fb;
+      --card: #ffffff;
+      --text: #1f2937;
+      --muted: #6b7280;
+      --border: #dbe3ee;
+      --accent: #2563eb;
+      --danger: #b91c1c;
+      --shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+      --radius: 16px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      margin-bottom: 20px;
+    }
+
+    h1, h2, h3 {
+      margin-top: 0;
+    }
+
+    .nav-links {
+      display: flex;
+      gap: 10px;
+    }
+
+    .nav-links a {
+      text-decoration: none;
+      color: white;
+      background: var(--accent);
+      padding: 10px 14px;
+      border-radius: 10px;
+    }
+
+    .grid {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: repeat(2, minmax(320px, 1fr));
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 18px;
+    }
+
+    .node-table {
+      display: grid;
+      grid-template-columns: 120px 1fr;
+      gap: 8px 12px;
+    }
+
+    .label {
+      color: var(--muted);
+    }
+
+    button {
+      border: none;
+      border-radius: 10px;
+      padding: 10px 14px;
+      cursor: pointer;
+      background: var(--accent);
+      color: white;
+      margin-right: 8px;
+      margin-top: 8px;
+    }
+
+    button.danger {
+      background: var(--danger);
+    }
+
+    input, select, textarea {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      font: inherit;
+    }
+
+    textarea {
+      min-height: 260px;
+      resize: vertical;
+      font-family: monospace;
+    }
+
+    .form-row {
+      margin-bottom: 12px;
+    }
+
+    .button-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .mono {
+      white-space: pre-wrap;
+      font-family: monospace;
+      background: #0f172a;
+      color: #e5e7eb;
+      padding: 12px;
+      border-radius: 12px;
+      min-height: 260px;
+      overflow: auto;
+    }
+
+    @media (max-width: 900px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="topbar">
+      <div>
+        <h1>ESP32 Debug</h1>
+        <p>Inspection, WiFi setup, file browsing, and logs</p>
+      </div>
+      <div class="nav-links">
+        <a href="./">Dashboard</a>
+        <a href="debug.html">Debug</a>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Node Info</h2>
+        <div class="node-table">
+          <div class="label">Start Time</div><div id="starttime">-</div>
+          <div class="label">MAC</div><div id="macaddr">-</div>
+          <div class="label">IP</div><div id="ipaddr">-</div>
+          <div class="label">Hostname</div><div id="hostname">-</div>
+          <div class="label">SSID</div><div id="wifiStatus">-</div>
+        </div>
+        <div class="button-row">
+          <button onclick="fetchNodeInfo()">Refresh Node Info</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>WiFi Setup</h2>
+        <div class="form-row">
+          <label>SSID</label>
+          <input id="wifiSsid" type="text" />
+        </div>
+        <div class="form-row">
+          <label>Password</label>
+          <input id="wifiPass" type="password" />
+        </div>
+        <div class="button-row">
+          <button onclick="saveWifi()">Save WiFi and Reboot</button>
+          <button class="danger" onclick="resetWifi()">Reset WiFi and Reboot</button>
+        </div>
+        <p id="wifiMsg"></p>
+      </div>
+
+      <div class="card">
+        <h2>Files</h2>
+        <div class="button-row">
+          <button onclick="loadFiles()">Load Files</button>
+        </div>
+        <div class="form-row">
+          <label>Available files</label>
+          <select id="fileList"></select>
+        </div>
+        <div class="button-row">
+          <button onclick="loadFileContent()">Load Selected File</button>
+        </div>
+        <textarea id="fileContent" placeholder="File content will appear here..."></textarea>
+      </div>
+
+      <div class="card">
+        <h2>Logs</h2>
+        <div class="button-row">
+          <button onclick="loadLogs()">Load Logs</button>
+          <button id="logAutoBtn" onclick="autoRefreshLogs()">Start Auto Refresh</button>
+        </div>
+        <div id="logs" class="mono">No logs loaded.</div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  let logTimer = null;
+
+  window.addEventListener("beforeunload", () => {
+    if (logTimer) {
+      clearInterval(logTimer);
+      logTimer = null;
+    }
+  });
+
+  async function fetchNodeInfo() {
+    try {
+      const res = await fetch("get_node");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const json = await res.json();
+      if (!json.node) return;
+
+      document.getElementById("starttime").textContent = json.node.starttime || "-";
+      document.getElementById("macaddr").textContent = json.node.mac || "-";
+      document.getElementById("ipaddr").textContent = json.node.ip || "-";
+      document.getElementById("hostname").textContent = json.node.name || "-";
+      document.getElementById("wifiStatus").textContent = json.node.ssid || "-";
+    } catch (err) {
+      console.error("fetchNodeInfo failed:", err);
+    }
+  }
+
+  async function loadFiles() {
+    try {
+      const res = await fetch("list_files");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const json = await res.json();
+      const select = document.getElementById("fileList");
+      select.innerHTML = "";
+
+      if (!Array.isArray(json.files)) {
+        console.error("json.files is not an array:", json.files);
+        return;
+      }
+
+      if (json.files.length === 0) {
+        const opt = document.createElement("option");
+        opt.value = "";
+        opt.textContent = "No files available";
+        select.appendChild(opt);
+        return;
+      }
+
+      json.files.forEach(f => {
+        const opt = document.createElement("option");
+        opt.value = f;
+        opt.textContent = f;
+        select.appendChild(opt);
+      });
+    } catch (err) {
+      console.error("loadFiles failed:", err);
+    }
+  }
+
+  async function loadFileContent() {
+    const file = document.getElementById("fileList").value;
+    if (!file) return;
+
+    try {
+      const res = await fetch("get_file?filename=" + encodeURIComponent(file));
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const text = await res.text();
+      document.getElementById("fileContent").value = text;
+    } catch (err) {
+      console.error("loadFileContent failed:", err);
+      document.getElementById("fileContent").value = "Failed to load file.";
+    }
+  }
+
+  async function loadLogs() {
+    try {
+      const res = await fetch("logs");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const text = await res.text();
+      const el = document.getElementById("logs");
+      el.textContent = text || "No logs available.";
+      el.scrollTop = el.scrollHeight;
+    } catch (err) {
+      console.error("loadLogs failed:", err);
+      document.getElementById("logs").textContent = "Failed to load logs.";
+    }
+  }
+
+  async function saveWifi() {
+    const ssid = document.getElementById("wifiSsid").value.trim();
+    const pass = document.getElementById("wifiPass").value;
+
+    if (!ssid) {
+      document.getElementById("wifiMsg").textContent = "SSID is required.";
+      return;
+    }
+
+    try {
+      const body = new URLSearchParams({ ssid, pass });
+      const res = await fetch("wifi_setup", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body
+      });
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const json = await res.json();
+      document.getElementById("wifiMsg").textContent = json.msg || "WiFi setup request sent.";
+    } catch (err) {
+      console.error("saveWifi failed:", err);
+      document.getElementById("wifiMsg").textContent = "WiFi setup failed.";
+    }
+  }
+
+  async function resetWifi() {
+    if (!confirm("Erase saved WiFi settings and reboot?")) return;
+
+    try {
+      const res = await fetch("wifi_reset", { method: "POST" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const json = await res.json();
+      document.getElementById("wifiMsg").textContent = json.msg || "WiFi reset request sent.";
+    } catch (err) {
+      console.error("resetWifi failed:", err);
+      document.getElementById("wifiMsg").textContent = "WiFi reset failed.";
+    }
+  }
+
+  function autoRefreshLogs() {
+    const btn = document.getElementById("logAutoBtn");
+
+    if (logTimer) {
+      clearInterval(logTimer);
+      logTimer = null;
+      btn.textContent = "Start Auto Refresh";
+      return;
+    }
+
+    loadLogs();
+    logTimer = setInterval(loadLogs, 5000);
+    btn.textContent = "Stop Auto Refresh";
+  }
+
+  async function initDebug() {
+    await fetchNodeInfo();
+    await loadFiles();
+    await loadLogs();
+  }
+
+  initDebug();
+</script>
+</body>
+</html>
