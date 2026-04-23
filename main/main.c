@@ -41,7 +41,7 @@
 /* ---------------- GLOBALS ---------------- */
 
 static const char *TAG = "webserver";
-static wl_handle_t wl_handle;
+static wl_handle_t wl_handle_storage;
 static char current_ssid[32] = "UNKNOWN";
 static char ip_str[16] = "UNKNOWN";
 static char hostname[32] = "UNKNOWN";
@@ -670,7 +670,7 @@ static esp_err_t serve_file(httpd_req_t *req, const char *path)
 
 static esp_err_t root_handler(httpd_req_t *req)
 {
-    return serve_file(req, STORAGE_PATH "/www/index.html");
+    return serve_file(req, "/www/index.html");
 }
 
 /* ---------------- LIST FILES ---------------- */
@@ -873,7 +873,14 @@ static esp_err_t logs_handler(httpd_req_t *req)
 
 static esp_err_t debug_handler(httpd_req_t *req)
 {
-    return serve_file(req, STORAGE_PATH "/www/debug.html");
+    return serve_file(req, "/www/debug.html");
+}
+
+static esp_err_t favicon_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "image/png");
+    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=86400");
+    return serve_file(req, "/www/favicon.png");
 }
 
 /* ---------------- SERVER ---------------- */
@@ -899,6 +906,7 @@ static void start_server(void)
     httpd_uri_t wifi_reset = { .uri = "/wifi_reset", .method = HTTP_POST, .handler = wifi_reset_handler };
     httpd_uri_t logs = { .uri = "/logs", .method = HTTP_GET, .handler = logs_handler };
     httpd_uri_t debug = { .uri = "/debug.html", .method = HTTP_GET, .handler = debug_handler };
+    httpd_uri_t favicon = { .uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_handler };
 
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &root));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &list));
@@ -910,6 +918,7 @@ static void start_server(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_reset));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &logs));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &debug));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &favicon));
 }
 
 /* ---------------- TIME ---------------- */
@@ -941,20 +950,30 @@ static void obtain_time(void)
 
 static void init_fatfs(void)
 {
-    const esp_vfs_fat_mount_config_t mount_config = {
+    const esp_vfs_fat_mount_config_t mount_config_www = {
         .format_if_mount_failed = false,
-        .max_files = 10  // max nr of open files at the same time
+        .max_files = 5
     };
 
-    esp_vfs_fat_spiflash_mount_rw_wl(
-        STORAGE_PATH,
-        "storage",
-        &mount_config,
-        &wl_handle
-    );
+    const esp_vfs_fat_mount_config_t mount_config_storage = {
+        .format_if_mount_failed = true,
+        .max_files = 10
+    };
 
-    mkdir(STORAGE_PATH "/data", 0775);
-    mkdir(STORAGE_PATH "/www", 0775);
+    ESP_ERROR_CHECK(esp_vfs_fat_spiflash_mount_ro(
+        "/www",
+        "www",
+        &mount_config_www
+    ));
+
+    ESP_ERROR_CHECK(esp_vfs_fat_spiflash_mount_rw_wl(
+        "/storage",
+        "storage",
+        &mount_config_storage,
+        &wl_handle_storage
+    ));
+
+    mkdir("/storage/data", 0775);
 }
 
 /* ---------------- MAIN ---------------- */
