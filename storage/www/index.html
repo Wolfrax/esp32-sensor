@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <link rel="icon" href="/favicon.png" type="image/png">
-  <title>ESP32 Sensor Orangerie</title>
+  <title>{{TITLE}}</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
     :root {
@@ -191,12 +191,12 @@
   <div class="container">
     <div class="topbar">
       <div class="title-group">
-        <h1>ESP32 Sensor Orangerie</h1>
+        <h1>{{TITLE}}</h1>
         <p>Live and historical readings</p>
       </div>
       <div class="nav-links">
-        <a href="./">Dashboard</a>
-        <a href="debug.html">Debug</a>
+        <a href="./?title={{TITLE}}">Dashboard</a>
+        <a href="debug.html?title={{TITLE}}">Debug</a>
       </div>
     </div>
 

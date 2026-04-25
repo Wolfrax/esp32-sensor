@@ -32,6 +32,10 @@ The firmware tries to load a previously saved SSID/password from NVS.
 - If no credentials exist, it starts in **AP mode** with a setup SSID
 
 This allows the device to either join an existing Wi-Fi network or provide its own configuration hotspot.
+When no credentials exists, it will create the WiFi SSID "ESP32-Setup" with password "12345678".
+The ESP32 device will have IP-address 192.168.4.1
+Connect to that WiFi and browse to "http://192.1684.1/debug.html", then using that page apply
+crendtials in the WiFi Setup box, do Save WiFi and reboot. The ESP32 should now connect to the wanted WiFi.
 
 ### 2. Time synchronization
 The device uses **SNTP** to obtain current time and sets the Sweden time zone.

@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <assert.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 #include "esp_sntp.h"
 #include "esp_system.h"
@@ -445,7 +446,6 @@ static void wifi_start_sta(const char *ssid, const char *pass)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_connect());
 
     ESP_LOGI(TAG, "Connecting to WiFi SSID: %s", ssid);
@@ -479,6 +479,36 @@ static void save_wifi_config(const char *ssid, const char *pass)
     nvs_close(nvs);
 }
 
+static int hex2int(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+static void url_decode(char *dst, const char *src, size_t dst_size)
+{
+    char *out = dst;
+    const char *end = dst + dst_size - 1;
+
+    while (*src && out < end) {
+        if (*src == '+') {
+            *out++ = ' ';
+            src++;
+        } else if (*src == '%' && isxdigit((unsigned char)src[1]) && isxdigit((unsigned char)src[2])) {
+            int hi = hex2int(src[1]);
+            int lo = hex2int(src[2]);
+            *out++ = (char)((hi << 4) | lo);
+            src += 3;
+        } else {
+            *out++ = *src++;
+        }
+    }
+
+    *out = '\0';
+}
+
 static esp_err_t wifi_setup_handler(httpd_req_t *req)
 {
     char buf[128];
@@ -497,6 +527,16 @@ static esp_err_t wifi_setup_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing ssid or pass");
         return ESP_FAIL;
     }
+
+    char decoded_ssid[sizeof(ssid)];
+    url_decode(decoded_ssid, ssid, sizeof(decoded_ssid));
+    strlcpy(ssid, decoded_ssid, sizeof(ssid));
+
+    char decoded_pass[sizeof(pass)];
+    url_decode(decoded_pass, pass, sizeof(decoded_pass));
+    strlcpy(pass, decoded_pass, sizeof(pass));
+
+    ESP_LOGI(TAG, "Decoded WiFi config: ssid=%s pass=%s", ssid, pass);
 
     save_wifi_config(ssid, pass);
 
@@ -646,6 +686,164 @@ static void sampling_task(void *arg)
 
 /* ---------------- FILE SERVING ---------------- */
 
+#define TEMPLATE_BUF_SIZE 256
+#define TITLE_MAX_LEN 64
+#define DEFAULT_TITLE "ESP32 Sensor"
+
+static void html_escape(char *dst, size_t dst_size, const char *src)
+{
+    char *out = dst;
+    size_t left = dst_size;
+
+    #define APPEND(s) do { \
+        int n = snprintf(out, left, "%s", (s)); \
+        if (n < 0 || (size_t)n >= left) goto done; \
+        out += n; \
+        left -= n; \
+    } while (0)
+
+    while (*src && left > 1) {
+        switch (*src) {
+            case '&': APPEND("&amp;"); break;
+            case '<': APPEND("&lt;"); break;
+            case '>': APPEND("&gt;"); break;
+            case '"': APPEND("&quot;"); break;
+            case '\'': APPEND("&#39;"); break;
+            default:
+                *out++ = *src;
+                left--;
+                break;
+        }
+        src++;
+    }
+
+done:
+    *out = '\0';
+    #undef APPEND
+}
+
+static esp_err_t serve_file_with_title(
+    httpd_req_t *req,
+    const char *path,
+    const char *title
+) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    const char *marker = "{{TITLE}}";
+    const size_t marker_len = strlen(marker);
+
+    char buf[TEMPLATE_BUF_SIZE];
+    char pending[sizeof("{{TITLE}}") - 1];  // marker_len - 1 chars max
+    size_t pending_len = 0;
+
+    size_t n;
+
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        char work[TEMPLATE_BUF_SIZE + sizeof("{{TITLE}}")];
+        size_t work_len = 0;
+
+        if (pending_len > 0) {
+            memcpy(work, pending, pending_len);
+            work_len += pending_len;
+            pending_len = 0;
+        }
+
+        memcpy(work + work_len, buf, n);
+        work_len += n;
+
+        size_t pos = 0;
+
+        while (pos < work_len) {
+            char *found = NULL;
+
+            for (size_t i = pos; i + marker_len <= work_len; i++) {
+                if (memcmp(&work[i], marker, marker_len) == 0) {
+                    found = &work[i];
+                    break;
+                }
+            }
+
+            if (found) {
+                size_t before_len = found - &work[pos];
+
+                if (before_len > 0) {
+                    esp_err_t err = httpd_resp_send_chunk(req, &work[pos], before_len);
+                    if (err != ESP_OK) {
+                        fclose(f);
+                        return err;
+                    }
+                }
+
+                if (title != NULL && title[0] != '\0') {
+                    esp_err_t err = httpd_resp_send_chunk(req, title, HTTPD_RESP_USE_STRLEN);
+                    if (err != ESP_OK) {
+                        fclose(f);
+                        return err;
+                    }
+                }
+
+                pos = (found - work) + marker_len;               
+            } else {
+                break;
+            }
+        }
+
+        /*
+         * Keep up to marker_len - 1 trailing chars, in case "{{TITLE}}"
+         * is split across two fread() calls.
+         */
+        size_t remaining = work_len - pos;
+
+        if (remaining >= marker_len) {
+            size_t send_len = remaining - (marker_len - 1);
+
+            ESP_ERROR_CHECK_WITHOUT_ABORT(
+                httpd_resp_send_chunk(req, &work[pos], send_len)
+            );
+
+            pos += send_len;
+            remaining = work_len - pos;
+        }
+
+        if (remaining > 0) {
+            memcpy(pending, &work[pos], remaining);
+            pending_len = remaining;
+        }
+    }
+
+    fclose(f);
+
+    if (pending_len > 0) {
+        httpd_resp_send_chunk(req, pending, pending_len);
+    }
+
+    return httpd_resp_send_chunk(req, NULL, 0);
+}
+
+static void get_request_title(httpd_req_t *req, char *out, size_t out_size)
+{
+    char query[128];
+    char raw_title[TITLE_MAX_LEN] = "";
+    char decoded_title[TITLE_MAX_LEN] = "";
+
+    strlcpy(out, DEFAULT_TITLE, out_size);   // default
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        if (httpd_query_key_value(query, "title", raw_title, sizeof(raw_title)) == ESP_OK &&
+            raw_title[0] != '\0') {
+
+            url_decode(decoded_title, raw_title, sizeof(decoded_title));
+            html_escape(out, out_size, decoded_title);
+        }
+    }
+}
+
 static esp_err_t serve_file(httpd_req_t *req, const char *path)
 {
     FILE *f = fopen(path, "r");
@@ -670,7 +868,11 @@ static esp_err_t serve_file(httpd_req_t *req, const char *path)
 
 static esp_err_t root_handler(httpd_req_t *req)
 {
-    return serve_file(req, "/www/index.html");
+    char title[TITLE_MAX_LEN * 6] = "";
+
+    get_request_title(req, title, sizeof(title));
+
+    return serve_file_with_title(req, "/www/index.html", title);
 }
 
 /* ---------------- LIST FILES ---------------- */
@@ -873,7 +1075,11 @@ static esp_err_t logs_handler(httpd_req_t *req)
 
 static esp_err_t debug_handler(httpd_req_t *req)
 {
-    return serve_file(req, "/www/debug.html");
+    char title[TITLE_MAX_LEN * 6] = "";
+
+    get_request_title(req, title, sizeof(title));
+
+    return serve_file_with_title(req, "/www/debug.html", title);
 }
 
 static esp_err_t favicon_handler(httpd_req_t *req)
@@ -888,7 +1094,7 @@ static esp_err_t favicon_handler(httpd_req_t *req)
 static void start_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 12;
+    config.max_uri_handlers = 11;  // We have 11 handlers
     config.max_open_sockets = 10;
     config.lru_purge_enable = true;
     config.recv_wait_timeout = 2;
@@ -906,7 +1112,7 @@ static void start_server(void)
     httpd_uri_t wifi_reset = { .uri = "/wifi_reset", .method = HTTP_POST, .handler = wifi_reset_handler };
     httpd_uri_t logs = { .uri = "/logs", .method = HTTP_GET, .handler = logs_handler };
     httpd_uri_t debug = { .uri = "/debug.html", .method = HTTP_GET, .handler = debug_handler };
-    httpd_uri_t favicon = { .uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_handler };
+    httpd_uri_t favicon = { .uri = "/favicon.png", .method = HTTP_GET, .handler = favicon_handler };
 
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &root));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &list));
@@ -990,11 +1196,12 @@ void app_main(void)
 
     if (load_wifi_config(ssid, sizeof(ssid), pass, sizeof(pass))) {
         wifi_start_sta(ssid, pass);
+        obtain_time();
+        ESP_LOGI(TAG, "System time obtained: %s", starttime_str);
     } else {
         wifi_start_ap();
     }
 
-    obtain_time();
     init_fatfs();
 
     sample_mutex = xSemaphoreCreateMutex();
